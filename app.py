@@ -4,9 +4,9 @@ app.py - 20점 Basic Reflected XSS 실습 문제 서버 (Flask)
 교육/CTF 실습용으로 의도된 Reflected XSS 취약점이 포함되어 있습니다.
 개선사항 적용 완료:
  1. Response Header charset=utf-8 명시
- 2. 실습 유효성을 위한 메인 페이지 접속 시 테스트 쿠키(session_id) 발급
- 3. HTML5 표준 규격(DOCTYPE, head, charset) 적용
- 4. Docker 컨테이너 바인딩 지원을 위한 기본 HOST=0.0.0.0 설정
+ 2. HTML5 표준 규격(DOCTYPE, head, charset) 적용
+ 3. Docker 컨테이너 바인딩 지원을 위한 기본 HOST=0.0.0.0 설정
+ 4. FLAG 및 테스트 쿠키를 발급하지 않으며, 플래그 검증은 CTF 플랫폼에서 별도 관리
 """
 
 import os
@@ -39,10 +39,7 @@ def error_page(status: int, title: str, message: str) -> Response:
 # ---------------------------------------------------------------------------
 @app.route("/", methods=["GET"])
 def index():
-    """
-    진입 페이지: 검색어 입력 폼.
-    실습 편의를 위해 접속 시 테스트용 세션 쿠키를 발급합니다.
-    """
+    """진입 페이지: 검색어 입력 폼을 표시하고 이전 실습 쿠키를 정리한다."""
     body = (
         "<!DOCTYPE html><html><head><meta charset='utf-8'>"
         "<title>Search</title></head><body>"
@@ -52,17 +49,12 @@ def index():
         "<button type='submit'>검색</button>"
         "</form></body></html>"
     )
+    # 이 애플리케이션은 FLAG, 인증 쿠키 또는 테스트 쿠키를 발급하지 않는다.
+    # 이전 버전에서 발급되었을 수 있는 쿠키가 브라우저에 남아 있다면 제거한다.
     res = html_response(body)
-    # 격리된 CTF 실습 전용 더미 쿠키입니다. 실제 인증/세션 토큰으로 사용하지 마세요.
-    # JavaScript 접근 실습을 위해 HttpOnly=False로 설정합니다.
-    res.set_cookie(
-        "xss_lab_test_cookie",
-        "dummy_guest_token_12345",
-        httponly=False,
-        secure=os.environ.get("COOKIE_SECURE", "0") == "1",
-        samesite="Lax",
-        path="/",
-    )
+    res.delete_cookie("FLAG", path="/")
+    res.delete_cookie("xss_lab_test_cookie", path="/")
+    # 플래그 검증 및 점수 처리는 CTF 플랫폼에서 별도로 관리한다.
     return res
 
 
