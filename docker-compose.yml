@@ -1,0 +1,13 @@
+services:
+  xss40:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      # 플래그 값은 같은 폴더의 .env 파일에서 읽는다 (.env 는 Git 에 올리지 않음).
+      CTF_FLAG: ${CTF_FLAG:?CTF_FLAG is not set (.env 파일 확인)}
+    # Chromium 은 /dev/shm 이 작으면(기본 64MB) 비정상 종료될 수 있다.
+    shm_size: "256m"
+    # 검증할 때마다 생기는 Chromium 자식 프로세스 정리용
+    init: true
+    restart: unless-stopped

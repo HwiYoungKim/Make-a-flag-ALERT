@@ -1,37 +1,114 @@
 """
-app.py - 20점 Basic Reflected XSS 실습 문제 서버 (Flask)
+app.py - 40점 Filtered Stored XSS 문제 서버 (Flask + Jinja2 + Playwright)
 
-교육/CTF 실습용으로 의도된 Reflected XSS 취약점이 포함되어 있습니다.
-개선사항 적용 완료:
- 1. Response Header charset=utf-8 명시
- 2. HTML5 표준 규격(DOCTYPE, head, charset) 적용
- 3. Docker 컨테이너 바인딩 지원을 위한 기본 HOST=0.0.0.0 설정
- 4. FLAG 및 테스트 쿠키를 발급하지 않으며, 플래그 검증은 CTF 플랫폼에서 별도 관리
+!! 경고 !!
+이 서버는 교육/CTF 실습용으로 "의도적으로" Stored XSS 취약점을 가지고 있다.
+반드시 격리된 환경에서만 실행하고, 공개 웹서비스에 배포하지 말 것.
+
+동작 흐름:
+  1) POST /comment       : 댓글 저장 (<script> 단순 필터, 최대 1000자, 최대 100개 FIFO)
+  2) GET  /board         : 댓글을 {{ body | safe }} 로 출력 -> 의도된 Stored XSS
+  3) POST /verify/<id>   : 해당 댓글 하나만 렌더링한 HTML 을 headless Chromium 에
+                           page.set_content() 로 넣고, alert 대화상자가 뜨면
+                           환경변수 CTF_FLAG 값을 text/plain 으로 반환한다.
+
+플래그 취급:
+  - 플래그는 오직 서버 프로세스의 환경변수 CTF_FLAG 에만 존재한다.
+  - Dockerfile / 이미지 / 쿠키 / 브라우저 페이지 어디에도 넣지 않는다.
+  - CTF_FLAG 가 없으면 /verify 는 500 을 반환한다 (플래그 노출 없음).
+
+검증 브라우저 격리:
+  - 서버 자신에게 HTTP 요청을 보내지 않는다 (단일 sync 워커 교착 방지).
+  - 모든 네트워크 요청은 route 로 차단한다 (외부 전송 불가).
+  - Chromium 샌드박스를 켠 상태로 실행한다 (CHROMIUM_SANDBOX=1 기본값).
+
+단일 프로세스 전제:
+  댓글을 프로세스 메모리에 저장하므로 gunicorn 은 --workers 1 --worker-class sync 로 실행한다.
+  서버를 재시작하면 댓글은 모두 초기화된다. (정상 동작)
 """
 
+import itertools
 import os
-from flask import Flask, Response, request
+
+from flask import Flask, Response, redirect, render_template, request, url_for
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import sync_playwright
+
+# ---------------------------------------------------------------------------
+# 설정
+# ---------------------------------------------------------------------------
+MAX_COMMENT_LENGTH = 1000      # 댓글당 최대 길이 (문자 수)
+MAX_COMMENTS = 100             # 최대 저장 댓글 수 (초과 시 FIFO)
+MAX_REQUEST_BYTES = 16 * 1024  # 요청 본문 최대 16 KiB (초과 시 413)
+
+VERIFY_LOAD_TIMEOUT_MS = 5000  # set_content 최대 대기
+VERIFY_WAIT_MS = 2000          # 로드 후 alert 를 기다리는 시간
+CHROMIUM_SANDBOX = os.environ.get("CHROMIUM_SANDBOX", "1") != "0"
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BYTES
+
+# 댓글 저장소: {"id": int, "body": str, "verified": None | bool}
+COMMENTS = []
+_id_counter = itertools.count(1)
 
 
 # ---------------------------------------------------------------------------
-# 공통 헬퍼
+# 헬퍼
 # ---------------------------------------------------------------------------
-def html_response(body: str, status: int = 200) -> Response:
-    """HTML 응답 생성 (UTF-8 인코딩 명시)"""
-    return Response(body, status=status, content_type="text/html; charset=utf-8")
+def plain_error(message: str, status: int) -> Response:
+    """고정 메시지 text/plain 응답. 사용자 입력은 포함하지 않는다."""
+    return Response(message, status=status, mimetype="text/plain")
 
 
-def error_page(status: int, title: str, message: str) -> Response:
-    """일반 오류 처리 페이지 (입력값 미반영으로 secondary XSS 방지)"""
-    body = (
-        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-        f"<title>{title}</title></head>"
-        f"<body><h1>{status} {title}</h1><p>{message}</p>"
-        "<p><a href='/'>검색 페이지로 돌아가기</a></p></body></html>"
-    )
-    return html_response(body, status)
+def contains_script_tag(comment: str) -> bool:
+    """
+    단순 문자열 필터: "<script>" 포함 여부를 대소문자 구분 없이 검사한다.
+    <img onerror>, <svg onload> 등은 막지 못한다. (의도된 학습 포인트)
+    """
+    return "<script>" in comment.lower()
+
+
+def find_comment(comment_id: int):
+    return next((c for c in COMMENTS if c["id"] == comment_id), None)
+
+
+def alert_fired(html: str) -> bool:
+    """
+    렌더링된 HTML 을 headless Chromium 에 직접 넣고, alert 대화상자가 떴는지 확인한다.
+    - 페이지에는 플래그/쿠키가 전혀 없다.
+    - 모든 네트워크 요청은 차단된다.
+    """
+    fired = False
+
+    def on_dialog(dialog):
+        nonlocal fired
+        if dialog.type == "alert":
+            fired = True
+        try:
+            dialog.dismiss()
+        except PlaywrightError:
+            pass
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, chromium_sandbox=CHROMIUM_SANDBOX)
+        try:
+            context = browser.new_context()
+            context.route("**/*", lambda route: route.abort())  # 외부/내부 네트워크 전부 차단
+            page = context.new_page()
+            page.on("dialog", on_dialog)
+            try:
+                page.set_content(html, wait_until="load", timeout=VERIFY_LOAD_TIMEOUT_MS)
+            except PlaywrightError:
+                pass  # 로드 지연/오류여도 그 사이 alert 가 떴을 수 있으므로 계속 진행
+            if not fired:
+                try:
+                    page.wait_for_timeout(VERIFY_WAIT_MS)
+                except PlaywrightError:
+                    pass  # 페이지가 스스로 닫히는 등의 경우
+        finally:
+            browser.close()
+    return fired
 
 
 # ---------------------------------------------------------------------------
@@ -39,73 +116,97 @@ def error_page(status: int, title: str, message: str) -> Response:
 # ---------------------------------------------------------------------------
 @app.route("/", methods=["GET"])
 def index():
-    """진입 페이지: 검색어 입력 폼을 표시하고 이전 실습 쿠키를 정리한다."""
-    body = (
-        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-        "<title>Search</title></head><body>"
-        "<h1>Search</h1>"
-        "<form action='/search' method='GET'>"
-        "<input type='text' name='keyword' placeholder='검색어 입력' autofocus>"
-        "<button type='submit'>검색</button>"
-        "</form></body></html>"
-    )
-    # 이 애플리케이션은 FLAG, 인증 쿠키 또는 테스트 쿠키를 발급하지 않는다.
-    # 이전 버전에서 발급되었을 수 있는 쿠키가 브라우저에 남아 있다면 제거한다.
-    res = html_response(body)
-    res.delete_cookie("FLAG", path="/")
-    res.delete_cookie("xss_lab_test_cookie", path="/")
-    # 플래그 검증 및 점수 처리는 CTF 플랫폼에서 별도로 관리한다.
-    return res
+    return redirect(url_for("board"))
 
 
-@app.route("/search", methods=["GET"])
-def search():
-    """
-    검색 엔드포인트
+@app.route("/board", methods=["GET"])
+def board():
+    return render_template("board.html", comments=COMMENTS, verify_mode=False)
 
-    [의도된 취약 동작]
-      keyword를 이스케이프/인코딩/필터링 없이 HTML 문자열에 그대로 삽입합니다. -> Reflected XSS
-    """
-    keyword = request.args.get("keyword")
 
-    # 일반 오류 처리: 파라미터 누락 / 빈 값
-    if keyword is None or keyword == "":
-        return error_page(400, "Bad Request", "검색어(keyword)를 입력해 주세요.")
+@app.route("/comment", methods=["POST"])
+def add_comment():
+    # 1) Content-Type
+    if request.mimetype != "application/x-www-form-urlencoded":
+        return plain_error("Unsupported Media Type: use application/x-www-form-urlencoded.", 415)
 
-    # ----- 의도된 취약 지점 (VULNERABLE BY DESIGN) -----
-    # HTML5 표준 구조 준수 및 키워드 미이스케이프 출력
-    body = (
-        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-        "<title>Search Result</title></head><body>"
-        "<h1>Search Result for: %s</h1>"
-        "<p><a href='/'>다시 검색</a></p>"
-        "</body></html>"
-    ) % keyword
-    # ---------------------------------------------------
-    return html_response(body)
+    comment = request.form.get("comment")
+
+    # 2) 누락/공백
+    if comment is None or comment.strip() == "":
+        return plain_error("Invalid input: comment is required.", 400)
+
+    # 3) 길이
+    if len(comment) > MAX_COMMENT_LENGTH:
+        return plain_error("Invalid input: comment is too long.", 400)
+
+    # 4) 단순 필터
+    if contains_script_tag(comment):
+        return plain_error("Invalid input: script tag is not allowed.", 400)
+
+    # 5) FIFO 후 저장 (원본 그대로)
+    while len(COMMENTS) >= MAX_COMMENTS:
+        COMMENTS.pop(0)
+    COMMENTS.append({"id": next(_id_counter), "body": comment, "verified": None})
+
+    # 6) PRG
+    return redirect(url_for("board"), code=303)
+
+
+@app.route("/verify/<int:comment_id>", methods=["POST"])
+def verify(comment_id: int):
+    target = find_comment(comment_id)
+    if target is None:
+        return plain_error("Not Found.", 404)
+
+    flag = os.environ.get("CTF_FLAG")
+    if not flag:
+        return plain_error("Server misconfigured.", 500)
+
+    # 대상 댓글 하나만, 폼/버튼 없이 렌더링 (내부 HTTP 요청 없음)
+    html = render_template("board.html", comments=[target], verify_mode=True)
+
+    try:
+        ok = alert_fired(html)
+    except Exception:  # 브라우저 기동 실패 등
+        app.logger.exception("verification failed")
+        return plain_error("Verification failed.", 500)
+
+    target["verified"] = ok
+    if ok:
+        return Response(flag, status=200, mimetype="text/plain")
+    return plain_error("No alert detected.", 200)
 
 
 # ---------------------------------------------------------------------------
-# 일반 HTTP 오류 처리
+# 일반 HTTP 오류 처리 (고정 메시지)
 # ---------------------------------------------------------------------------
+@app.errorhandler(400)
+def bad_request(_e):
+    return plain_error("Bad Request.", 400)
+
+
 @app.errorhandler(404)
 def not_found(_e):
-    return error_page(404, "Not Found", "요청한 페이지를 찾을 수 없습니다.")
+    return plain_error("Not Found.", 404)
 
 
 @app.errorhandler(405)
 def method_not_allowed(_e):
-    return error_page(405, "Method Not Allowed", "허용되지 않는 요청 방식입니다. (GET만 지원)")
+    return plain_error("Method Not Allowed.", 405)
+
+
+@app.errorhandler(413)
+def payload_too_large(_e):
+    return plain_error("Payload Too Large.", 413)
 
 
 @app.errorhandler(500)
-def server_error(_e):
-    return error_page(500, "Internal Server Error", "서버 내부 오류가 발생했습니다.")
+def internal_error(_e):
+    return plain_error("Internal Server Error.", 500)
 
 
 if __name__ == "__main__":
-    # 0.0.0.0은 컨테이너의 네트워크 인터페이스에서 요청을 수신하도록 합니다.
-    # 외부 접속을 위해서는 실행 환경의 포트 공개/매핑도 별도로 설정해야 합니다.
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8080"))
-    app.run(host=host, port=port, debug=False)
+    app.run(host=host, port=port, debug=False, use_reloader=False, threaded=False)

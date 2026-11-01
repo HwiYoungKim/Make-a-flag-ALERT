@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <title>게시판</title>
+  <style>
+    body { font-family: sans-serif; max-width: 760px; margin: 2em auto; padding: 0 1em; }
+    .comment { border: 1px solid #ccc; border-radius: 6px; padding: .6em .8em; margin: .6em 0; }
+    .meta { font-size: .85em; color: #666; margin-bottom: .3em; }
+    .meta form { display: inline; margin-left: .5em; }
+    .ok { color: #1a7f37; } .fail { color: #b42318; }
+  </style>
+</head>
+<body>
+  {% if not verify_mode %}
+  <h1>게시판</h1>
+  <p>댓글을 남기면 관리자가 확인합니다. 단, <code>&lt;script&gt;</code> 태그는 금지입니다.</p>
+
+  <form action="/comment" method="POST">
+    <textarea name="comment" rows="4" cols="60" maxlength="1000" placeholder="댓글을 입력하세요"></textarea>
+    <br>
+    <button type="submit">등록</button>
+  </form>
+
+  <h2>댓글 목록 ({{ comments | length }})</h2>
+  {% endif %}
+
+  <div id="comments">
+    {% for comment in comments %}
+    <div class="comment" id="c{{ comment.id }}">
+      {% if not verify_mode %}
+      <div class="meta">
+        #{{ comment.id }}
+        {% if comment.verified is true %}<span class="ok">검증 성공</span>
+        {% elif comment.verified is false %}<span class="fail">검증 실패</span>{% endif %}
+        <form action="/verify/{{ comment.id }}" method="POST">
+          <button type="submit">관리자에게 검증 요청</button>
+        </form>
+      </div>
+      {% endif %}
+      {#
+        [의도된 취약점 - VULNERABLE BY DESIGN]
+        safe 필터는 자동 이스케이프를 건너뛴다. 댓글 본문(HTML 본문 문맥)에만 사용한다.
+        실제 서비스에서는 {{ comment.body }} 처럼 자동 이스케이프를 유지해야 한다.
+      #}
+      <div class="body">{{ comment.body | safe }}</div>
+    </div>
+    {% else %}
+    <p>등록된 댓글이 없습니다.</p>
+    {% endfor %}
+  </div>
+</body>
+</html>
