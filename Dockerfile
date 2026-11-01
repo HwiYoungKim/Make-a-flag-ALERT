@@ -1,35 +1,27 @@
-# Dockerfile - 40점 Filtered Stored XSS 문제 서버
-# 교육용 CTF 전용 이미지입니다.
-#
-# 플래그는 이미지에 넣지 않습니다. 실행 시 환경변수 CTF_FLAG 로만 주입합니다.
-#   docker run -p 8080:8080 --shm-size=256m -e CTF_FLAG='<플래그 값>' <image>
+# Dockerfile — 20점 Basic Reflected XSS 실습 서버
+# 격리된 CTF 실습 환경에서만 사용하세요.
 
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     HOST=0.0.0.0 \
     PORT=8080
 
 WORKDIR /app
 
-# root 단계: 패키지, Chromium 및 시스템 의존성 설치 (--with-deps 는 root 필요)
-RUN pip install --no-cache-dir Flask==3.1.3 gunicorn==23.0.0 playwright==1.63.0 \
-    && playwright install --with-deps chromium \
-    && chmod -R a+rX /ms-playwright \
-    && rm -rf /var/lib/apt/lists/* \
-    && adduser --disabled-password --gecos "" appuser
+# Flask 앱과 실행에 필요한 WSGI 서버 설치
+RUN pip install --no-cache-dir Flask gunicorn
 
-COPY --chown=appuser:appuser app.py /app/app.py
-COPY --chown=appuser:appuser templates /app/templates
+# app.py는 Dockerfile과 같은 빌드 컨텍스트에 있어야 합니다.
+COPY app.py /app/app.py
 
-# Chromium 샌드박스는 root 로 실행되지 않으므로 반드시 일반 사용자로 실행한다.
-USER appuser
+# FLAG는 소스코드에 넣지 않고 별도 파일로 주입합니다.
+# flag.txt는 이 Dockerfile과 같은 디렉토리에 두고 빌드하되,
+# GitHub 등 공개 저장소에는 절대 커밋하지 마세요 (.gitignore에 추가 권장).
+COPY flag.txt /app/flag.txt
 
 EXPOSE 8080
 
-# 단일 워커 / sync: 댓글이 프로세스 메모리에 있으므로 필수.
-# 검증 한 번에 수 초가 걸리므로 timeout 을 60초로 둔다.
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--worker-class", "sync", \
-     "--timeout", "60", "--access-logfile", "-", "--error-logfile", "-", "app:app"]
+# 개발 서버 대신 Gunicorn으로 Flask 애플리케이션 실행
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "app:app"]
